@@ -186,6 +186,7 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
+from reasoning_watchdog import ReasoningWatchdog, DEFAULT_MAX_REASONING_TOKENS
 from hermes_cli.config import cfg_get
 
 
@@ -1371,6 +1372,18 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
+        # Client-side reasoning-token watchdog: caps runaway "thinking" that the
+        # vLLM MTP path fails to enforce via thinking_token_budget (issue #39573).
+        # Cap source order: request_overrides.max_reasoning_tokens, then the
+        # legacy request_overrides.extra_body.thinking_token_budget (so the client
+        # mirrors the server budget already configured), then the module default.
+        _ro = self.request_overrides or {}
+        _cap = _ro.get("max_reasoning_tokens")
+        if _cap is None:
+            _cap = (_ro.get("extra_body") or {}).get("thinking_token_budget")
+        if _cap is None:
+            _cap = DEFAULT_MAX_REASONING_TOKENS
+        self._reasoning_watchdog = ReasoningWatchdog(max_reasoning_tokens=_cap)
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
@@ -7677,6 +7690,7 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
+            self._reasoning_watchdog.reset()  # per-stream reasoning-token cap
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
                 self._touch_activity("receiving stream response")
@@ -7720,6 +7734,20 @@ class AIAgent:
                     reasoning_parts.append(reasoning_text)
                     _fire_first_delta()
                     self._fire_reasoning_delta(reasoning_text)
+                    # Reasoning-token watchdog: vLLM's MTP path does not enforce
+                    # thinking_token_budget (#39573), so cap runaway reasoning
+                    # here.  When the cap trips, request interrupt to break the
+                    # stream cleanly at the top-of-loop check; the turn ends
+                    # bounded instead of spiralling.
+                    if self._reasoning_watchdog.note_reasoning_delta(reasoning_text) and not self._interrupt_requested:
+                        logger.warning(
+                            "Reasoning watchdog tripped (~%d tokens > cap %d); "
+                            "interrupting runaway reasoning stream.%s",
+                            self._reasoning_watchdog.tokens,
+                            self._reasoning_watchdog.max_reasoning_tokens,
+                            self._client_log_context() if hasattr(self, "_client_log_context") else "",
+                        )
+                        self._interrupt_requested = True
 
                 # Accumulate text content — fire callback only when no tool calls
                 if delta and delta.content:
