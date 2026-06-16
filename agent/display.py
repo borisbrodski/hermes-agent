@@ -111,6 +111,108 @@ def get_tool_preview_max_len() -> int:
     return _tool_preview_max_len
 
 
+_ELLIPSIS = "..."
+# How much of the budget to reserve for the trailing suffix in the
+# stateless fallback (2/5 ≈ 40%).  Chosen so shell-style commands keep
+# enough of the trailing action visible to differentiate consecutive
+# previews that share a `cd <path>` prefix.
+_TAIL_FRACTION_NUM = 2
+_TAIL_FRACTION_DEN = 5
+
+
+def truncate_middle(
+    text: str,
+    max_len: int,
+    prev: str | None = None,
+    prev_trunc: str | None = None,
+) -> str:
+    """Truncate ``text`` to at most ``max_len`` chars, filling the budget
+    with as much content as possible while revealing what differs from
+    ``prev``.
+
+    Resolution order (each step skipped if it doesn't apply):
+
+    1. ``text == prev`` and ``prev_trunc`` provided → return ``prev_trunc``.
+       The dedup-by-equality contract is preserved by *construction*: an
+       identical re-call yields the same string downstream sees.
+    2. ``text`` fits in ``max_len`` → return ``text`` unchanged.  No
+       reason to hide characters we have room to display.
+    3. ``prev`` provided → show ``text`` from the first differing char
+       through the end (the part the reader needs to see), then prepend
+       as much of the shared prefix as remaining budget allows (with
+       ``"..."`` to mark the elision).
+    4. Otherwise → stateless head + ellipsis + short tail truncation.
+
+    ``max_len`` values ``<= 0`` produce ``""``.
+    """
+    if prev is not None and prev_trunc is not None and text == prev:
+        return prev_trunc
+
+    if max_len <= 0:
+        return ""
+
+    if len(text) <= max_len:
+        return text
+
+    if prev:
+        diff_view = _truncate_around_diff(text, prev, max_len)
+        if diff_view is not None:
+            return diff_view
+
+    return _head_tail_truncate(text, max_len)
+
+
+def _truncate_around_diff(text: str, prev: str, max_len: int) -> str | None:
+    """Build a truncation of the form ``text[:keep] + "..." + text[diff:]``
+    that fills as much of ``max_len`` as possible while keeping the
+    chars from the first divergence onward fully visible.
+
+    Returns ``None`` when no useful diff-aware truncation exists (no
+    shared prefix, or the must-show tail alone overflows ``max_len``).
+    """
+    n = min(len(text), len(prev))
+    i = 0
+    while i < n and text[i] == prev[i]:
+        i += 1
+
+    if i == 0 or i == len(text):
+        # No shared prefix to elide, or text is itself a prefix of prev
+        # (nothing new to highlight in text).  Caller can fall back.
+        return None
+
+    tail = text[i:]
+    if len(tail) > max_len:
+        # The mandatory "from diff onward" portion alone overflows;
+        # caller should head-tail the whole string instead.
+        return None
+
+    head_budget = max_len - len(tail)
+    # We know text doesn't fit (caller checked) so head_budget < i.
+    el = len(_ELLIPSIS)
+
+    if head_budget >= el + 1:
+        # Show beginning of prefix + ellipsis + tail.
+        keep = head_budget - el
+        return text[:keep] + _ELLIPSIS + tail
+
+    # head_budget is too small for "...x" + tail.  Use ellipsis alone
+    # if it fits as a marker; otherwise emit tail without any prefix.
+    if el + len(tail) <= max_len:
+        return _ELLIPSIS + tail
+    return tail
+
+
+def _head_tail_truncate(text: str, max_len: int) -> str:
+    """Stateless: keep the head, drop the middle, keep a short tail.
+    Used as a fallback when no prev preview is available."""
+    avail = max_len - len(_ELLIPSIS)
+    if avail < 2:
+        return text[:max_len]
+    suffix_len = max(1, avail * _TAIL_FRACTION_NUM // _TAIL_FRACTION_DEN)
+    prefix_len = avail - suffix_len
+    return text[:prefix_len] + _ELLIPSIS + text[-suffix_len:]
+
+
 # =========================================================================
 # Skin-aware helpers (lazy import to avoid circular deps)
 # =========================================================================

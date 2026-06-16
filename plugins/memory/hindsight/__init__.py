@@ -1321,7 +1321,26 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    # HU6/HU7 (2026-06-05): auto-recall floods context — a single
+                    # query can match 70+ facts (many near-duplicate), and dumping
+                    # all of them buries the precise answer and amplifies drift
+                    # (agents replicate the quality of what they recall). Cap the
+                    # AUTO-injected set to the few MOST-RECENT matching facts,
+                    # date-sorted (recent first). The explicit hindsight_recall
+                    # TOOL path (below) is left untouched, so an agent can still
+                    # deliberately pull the full / historical result set.
+                    _prefetch_max = int(self._config.get("recall_prefetch_max_facts", 5) or 5)
+                    _results = list(resp.results or [])
+                    def _recency_key(r):
+                        return (getattr(r, "mentioned_at", None)
+                                or getattr(r, "occurred_end", None)
+                                or getattr(r, "occurred_start", None) or "")
+                    try:
+                        _results.sort(key=_recency_key, reverse=True)
+                    except Exception:
+                        pass
+                    _results = _results[:_prefetch_max]
+                    text = "\n".join(f"- {r.text}" for r in _results if r.text) if _results else ""
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text

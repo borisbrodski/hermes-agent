@@ -123,6 +123,9 @@ async def test_sentinel_cleaned_up_after_handler_returns():
     assert session_key not in runner._running_agents, (
         "Sentinel must be removed after handler completes"
     )
+    assert runner._update_runtime_status.call_count >= 2, (
+        "Runtime status should refresh when the sentinel is claimed and when it is released"
+    )
 
 
 # ------------------------------------------------------------------
@@ -440,6 +443,7 @@ async def test_stop_hard_kills_running_agent():
         (session_key, "12345")
     ]
     assert runner.adapters[Platform.TELEGRAM]._active_sessions[session_key].is_set()
+    runner._update_runtime_status.assert_called_once()
 
     # Must return a confirmation
     assert result is not None

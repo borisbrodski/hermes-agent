@@ -1895,16 +1895,27 @@ class GatewayRunner:
             ),
         }
 
+        # Read config-level request overrides (e.g. parallel_tool_calls: false
+        # for llama.cpp/jinja servers that fail on multiple tool_call blocks).
+        _config_overrides: dict = {}
+        try:
+            _agent_section = (self.config.get("agent", {}) or {}) if hasattr(self, "config") else {}
+            _config_overrides = dict(_agent_section.get("request_overrides", {}) or {})
+        except Exception:
+            pass
+
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
-            route["request_overrides"] = {}
+            route["request_overrides"] = _config_overrides
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides or {}
+        merged = dict(overrides or {})
+        merged.update(_config_overrides)
+        route["request_overrides"] = merged
         return route
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
@@ -2128,6 +2139,16 @@ class GatewayRunner:
             )
         except Exception:
             pass
+
+    def _sync_running_agent_runtime_status(
+        self,
+        gateway_state: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+    ) -> None:
+        self._update_runtime_status(
+            gateway_state=gateway_state,
+            exit_reason=exit_reason,
+        )
 
     def _update_platform_runtime_status(
         self,
@@ -5009,6 +5030,9 @@ class GatewayRunner:
             self.adapters.clear()
             self._running_agents.clear()
             self._running_agents_ts.clear()
+            self._sync_running_agent_runtime_status(
+                "draining" if self._draining else None
+            )
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
@@ -5910,6 +5934,7 @@ class GatewayRunner:
                     reason="stale_running_agent_eviction",
                 )
                 self._release_running_agent_state(_quick_key)
+                self._sync_running_agent_runtime_status()
 
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
@@ -5949,6 +5974,7 @@ class GatewayRunner:
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command",
                 )
+                self._sync_running_agent_runtime_status()
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key)
                 return EphemeralReply(t("gateway.stop.stopped"))
 
@@ -6171,6 +6197,7 @@ class GatewayRunner:
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
+                    self._sync_running_agent_runtime_status()
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
@@ -6630,6 +6657,7 @@ class GatewayRunner:
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        self._sync_running_agent_runtime_status()
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -6683,6 +6711,7 @@ class GatewayRunner:
                 self._running_agents_ts.pop(_quick_key, None)
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
+                self._sync_running_agent_runtime_status()
 
     async def _prepare_inbound_message_text(
         self,
@@ -8568,6 +8597,7 @@ class GatewayRunner:
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_pending",
             )
+            self._sync_running_agent_runtime_status()
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
@@ -11440,6 +11470,7 @@ class GatewayRunner:
 
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
+        self._sync_running_agent_runtime_status()
 
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
@@ -14281,6 +14312,11 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        # Diff-aware preview truncation (truncate_middle):
+        last_progress_preview = [None]  # last untruncated preview
+        last_progress_preview_trunc = [None]  # its truncated form (cached so
+                                              # identical re-calls return the
+                                              # exact same string → (×N) dedup)
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -14390,13 +14426,26 @@ class GatewayRunner:
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
+            #
+            # Use diff-aware truncation: when the new preview shares a long
+            # common prefix with the previous one (e.g. successive
+            # `cd <same_path> && <different cmd>` calls), reveal the
+            # differing tail instead of head-cutting both to the same prefix.
+            # Identical inputs return the cached truncated form, so the
+            # dedup-by-equality below still collapses true repeats into a
+            # (×N) counter.
             if preview:
-                from agent.display import get_tool_preview_max_len
+                from agent.display import get_tool_preview_max_len, truncate_middle
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                truncated = truncate_middle(
+                    preview, _cap,
+                    prev=last_progress_preview[0],
+                    prev_trunc=last_progress_preview_trunc[0],
+                )
+                last_progress_preview[0] = preview
+                last_progress_preview_trunc[0] = truncated
+                msg = f"{emoji} {tool_name}: \"{truncated}\""
             else:
                 msg = f"{emoji} {tool_name}..."
             
@@ -15496,6 +15545,9 @@ class GatewayRunner:
             self._running_agents[session_key] = agent_holder[0]
             if self._draining:
                 self._update_runtime_status("draining")
+                self._sync_running_agent_runtime_status(
+                    "draining" if self._draining else None
+                )
         
         tracking_task = asyncio.create_task(track_agent())
         
@@ -16034,6 +16086,8 @@ class GatewayRunner:
                 )
             if self._draining:
                 self._update_runtime_status("draining")
+            elif self._draining:
+                self._sync_running_agent_runtime_status("draining")
             
             # Wait for cancelled tasks
             for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
