@@ -485,6 +485,21 @@ def init_agent(
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
+    # Client-side reasoning-token watchdog: caps runaway "thinking" that the
+    # vLLM MTP path fails to enforce via thinking_token_budget (issue #39573).
+    # Cap source order: request_overrides.max_reasoning_tokens, then the
+    # legacy request_overrides.extra_body.thinking_token_budget, then default.
+    try:
+        from reasoning_watchdog import ReasoningWatchdog, DEFAULT_MAX_REASONING_TOKENS
+        _ro = agent.request_overrides or {}
+        _cap = _ro.get("max_reasoning_tokens")
+        if _cap is None:
+            _cap = (_ro.get("extra_body") or {}).get("thinking_token_budget")
+        if _cap is None:
+            _cap = DEFAULT_MAX_REASONING_TOKENS
+        agent._reasoning_watchdog = ReasoningWatchdog(max_reasoning_tokens=_cap)
+    except Exception:
+        pass  # watchdog optional; agent runs fine without it
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     

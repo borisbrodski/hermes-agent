@@ -1583,6 +1583,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    # Per-stream reset of the reasoning-token watchdog (caps runaway thinking;
+    # enforcement lives in agent._fire_reasoning_delta).
+    _wd = getattr(agent, "_reasoning_watchdog", None)
+    if _wd is not None:
+        _wd.reset()
+
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
         # in _interruptible_api_call already calls it; we just need to

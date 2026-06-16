@@ -3125,16 +3125,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
 
+        # Config-level request overrides (e.g. parallel_tool_calls: false for
+        # llama.cpp/jinja servers that fail on multiple tool_call blocks, plus
+        # per-profile sampling). Upstream only applies fast-mode overrides; merge
+        # in the profile's agent.request_overrides so they actually take effect.
+        _config_overrides: dict = {}
+        try:
+            _agent_section = (self.config.get("agent", {}) or {}) if hasattr(self, "config") else {}
+            _config_overrides = dict(_agent_section.get("request_overrides", {}) or {})
+        except Exception:
+            pass
+
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
-            route["request_overrides"] = {}
+            route["request_overrides"] = _config_overrides
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides or {}
+        merged = dict(overrides or {})
+        merged.update(_config_overrides)
+        route["request_overrides"] = merged
         return route
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:

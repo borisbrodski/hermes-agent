@@ -4210,6 +4210,19 @@ class AIAgent:
                 cb(text)
             except Exception:
                 pass
+        # Client-side reasoning-token watchdog (#39573): vLLM's MTP path does
+        # not enforce thinking_token_budget, so cap runaway reasoning here.
+        # When the per-stream cap trips, request interrupt; the streaming loop
+        # breaks at its next `_interrupt_requested` check, ending the turn
+        # bounded instead of decoding hidden <think> tokens for minutes.
+        _wd = getattr(self, "_reasoning_watchdog", None)
+        if _wd is not None and _wd.note_reasoning_delta(text) and not self._interrupt_requested:
+            logger.warning(
+                "Reasoning watchdog tripped (~%d tokens > cap %d); interrupting runaway reasoning stream.",
+                _wd.tokens,
+                _wd.max_reasoning_tokens,
+            )
+            self._interrupt_requested = True
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
