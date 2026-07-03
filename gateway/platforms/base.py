@@ -2081,7 +2081,7 @@ class BasePlatformAdapter(ABC):
         if not isinstance(event, ToolCallChunk):
             return None
 
-        from agent.display import get_tool_emoji
+        from agent.display import get_tool_emoji, truncate_middle
         emoji = get_tool_emoji(event.tool_name, default="⚙️")
 
         if mode == "verbose":
@@ -2089,7 +2089,7 @@ class BasePlatformAdapter(ABC):
                 import json
                 args_str = json.dumps(event.args, ensure_ascii=False, default=str)
                 if preview_max_len > 0 and len(args_str) > preview_max_len:
-                    args_str = args_str[:preview_max_len - 3] + "..."
+                    args_str = truncate_middle(args_str, preview_max_len)
                 return f"{emoji} {event.tool_name}({list(event.args.keys())})\n{args_str}"
             if event.preview:
                 return f"{emoji} {event.tool_name}: \"{event.preview}\""
@@ -2097,12 +2097,18 @@ class BasePlatformAdapter(ABC):
 
         # "all" / "new": short preview, capped (default 40 to keep gateway
         # progress bubbles compact — they persist as permanent messages).
+        # Use truncate_middle so we keep the *important* parts (the filename
+        # tail, and — vs the previous tool call — the part that differs)
+        # instead of a trailing "..." that hides the meaningful end.
         preview = event.preview
         if preview:
             cap = preview_max_len if preview_max_len > 0 else 40
-            if len(preview) > cap:
-                preview = preview[:cap - 3] + "..."
-            return f"{emoji} {event.tool_name}: \"{preview}\""
+            prev = getattr(self, "_tool_preview_prev", None)
+            prev_trunc = getattr(self, "_tool_preview_prev_trunc", None)
+            shown = truncate_middle(preview, cap, prev=prev, prev_trunc=prev_trunc)
+            self._tool_preview_prev = preview
+            self._tool_preview_prev_trunc = shown
+            return f"{emoji} {event.tool_name}: \"{shown}\""
         return f"{emoji} {event.tool_name}..."
 
     @property

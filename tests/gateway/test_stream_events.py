@@ -101,9 +101,10 @@ def test_tool_preview_truncated_to_cap():
         enqueue_tool_line=lines.append, tool_mode="all", preview_max_len=10,
     )
     d.dispatch(ToolCallChunk(tool_name="x", preview="0123456789ABCDEF"))
-    # capped at 10 → 7 chars + "..." (then wrapped in quotes by the renderer)
-    assert '"0123456..."' in lines[0]
-    assert "89ABCDEF" not in lines[0]
+    # capped at 10 → truncate_middle keeps head + "..." + the meaningful tail
+    # (e.g. a filename) instead of a trailing "..." that hides the end.
+    assert '"01234...EF"' in lines[0]
+    assert "56789ABC" not in lines[0]  # elided middle is hidden
 
 
 def test_new_mode_dedups_same_tool():

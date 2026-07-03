@@ -397,8 +397,10 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     preview = _oneline(str(value))
     if not preview:
         return None
-    if max_len > 0 and len(preview) > max_len:
-        preview = preview[:max_len - 3] + "..."
+    # Show the important parts (head + filename tail) instead of a trailing
+    # "..." that hides the meaningful end (e.g. the filename in a path).
+    if max_len > 0:
+        return truncate_middle(preview, max_len)
     return preview
 
 
