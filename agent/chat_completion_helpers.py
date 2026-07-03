@@ -26,7 +26,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
-from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from hermes_constants import (
+    PARTIAL_STREAM_STUB_ID,
+    REASONING_BUDGET_STUB_ID,
+    FINISH_REASON_LENGTH,
+)
 from agent.error_classifier import FailoverReason
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
@@ -1588,6 +1592,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _wd = getattr(agent, "_reasoning_watchdog", None)
     if _wd is not None:
         _wd.reset()
+    # Per-stream reset of the budget-force signal so a fresh stream starts clean
+    # (s1 budget forcing; set in agent._fire_reasoning_delta when the watchdog trips).
+    agent._reasoning_budget_forced = False
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -1887,6 +1894,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if agent._interrupt_requested:
                 break
+            if getattr(agent, "_reasoning_budget_forced", False):
+                # s1 budget forcing: the reasoning watchdog tripped. Stop reading
+                # the stream and fall through to build a length-style stub so the
+                # outer finish_reason=="length" continuation loop resumes the model
+                # after a forced </think>. This is NOT an abort.
+                finish_reason = "length"
+                break
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -2114,6 +2128,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             effective_finish_reason = "length"
 
         full_reasoning = "".join(reasoning_parts) or None
+        _budget_forced = getattr(agent, "_reasoning_budget_forced", False)
+        if _budget_forced and full_reasoning is not None:
+            # s1 budget forcing: terminate the partial reasoning with </think> so
+            # the continuation request forces the model out of <think> and into an
+            # answer / tool call. Guard against double-injection if the model had
+            # already emitted the delimiter just before the trip.
+            from reasoning_watchdog import END_OF_THINKING_STR
+
+            if not full_reasoning.rstrip().endswith(END_OF_THINKING_STR):
+                full_reasoning = full_reasoning + "\n" + END_OF_THINKING_STR
         mock_message = SimpleNamespace(
             role=role,
             content=full_content,
@@ -2123,10 +2147,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         mock_choice = SimpleNamespace(
             index=0,
             message=mock_message,
-            finish_reason=effective_finish_reason,
+            finish_reason=("length" if _budget_forced else effective_finish_reason),
         )
         return SimpleNamespace(
-            id="stream-" + str(uuid.uuid4()),
+            id=(REASONING_BUDGET_STUB_ID if _budget_forced else "stream-" + str(uuid.uuid4())),
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,

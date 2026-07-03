@@ -561,6 +561,11 @@ def apply_ipv4_preference(force: bool = False) -> None:
 # Response ID for partial stream stubs used during error recovery
 PARTIAL_STREAM_STUB_ID = "partial-stream-stub"
 
+# Response ID for the stub returned when the reasoning watchdog forces
+# end-of-thinking (s1 "budget forcing"). Routed through the finish_reason=="length"
+# continuation loop so the model resumes after a forced </think>.
+REASONING_BUDGET_STUB_ID = "reasoning-budget-forced-stub"
+
 FINISH_REASON_LENGTH = "length"
 
 

@@ -2385,6 +2385,7 @@ class AIAgent:
     def clear_interrupt(self) -> None:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""
         self._interrupt_requested = False
+        self._reasoning_budget_forced = False
         self._interrupt_message = None
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
@@ -4212,17 +4213,26 @@ class AIAgent:
                 pass
         # Client-side reasoning-token watchdog (#39573): vLLM's MTP path does
         # not enforce thinking_token_budget, so cap runaway reasoning here.
-        # When the per-stream cap trips, request interrupt; the streaming loop
-        # breaks at its next `_interrupt_requested` check, ending the turn
-        # bounded instead of decoding hidden <think> tokens for minutes.
+        # When the per-stream cap trips, we do NOT abort the turn; instead we set
+        # a distinct signal so the streaming loop stops reading reasoning,
+        # terminates the partial reasoning with </think>, and issues a
+        # continuation request (s1 "budget forcing") so the model still produces
+        # its answer / tool call — bounded instead of decoding hidden <think>
+        # tokens for minutes.
         _wd = getattr(self, "_reasoning_watchdog", None)
-        if _wd is not None and _wd.note_reasoning_delta(text) and not self._interrupt_requested:
+        if (
+            _wd is not None
+            and _wd.note_reasoning_delta(text)
+            and not getattr(self, "_reasoning_budget_forced", False)
+        ):
             logger.warning(
-                "Reasoning watchdog tripped (~%d tokens > cap %d); interrupting runaway reasoning stream.",
+                "Reasoning watchdog tripped (~%d tokens > cap %d); forcing end-of-thinking "
+                "and continuing (budget forcing).",
                 _wd.tokens,
                 _wd.max_reasoning_tokens,
             )
-            self._interrupt_requested = True
+            # Distinct flag: the stream loop stops reading but does NOT abort the turn.
+            self._reasoning_budget_forced = True
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.

@@ -58,7 +58,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from hermes_constants import PARTIAL_STREAM_STUB_ID, REASONING_BUDGET_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -1570,8 +1570,18 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # s1 budget forcing: a reasoning-watchdog stub is DELIBERATELY
+                    # truncated mid-thinking (reasoning terminated with </think>)
+                    # so the continuation loop resumes the model. It must NOT be
+                    # treated as thinking-budget exhaustion — otherwise the turn
+                    # would bail with a "Thinking Budget Exhausted" terminal
+                    # instead of continuing. (Top correctness guard for this path.)
+                    _is_budget_forced_stub = (
+                        getattr(response, "id", "") == REASONING_BUDGET_STUB_ID
+                    )
                     _thinking_exhausted = (
-                        not _trunc_has_tool_calls
+                        not _is_budget_forced_stub
+                        and not _trunc_has_tool_calls
                         and _has_think_tags
                         and (
                             (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
@@ -3487,6 +3497,11 @@ def run_conversation(
             continue
 
         if _retry.restart_with_length_continuation:
+            # s1 budget forcing: clear the watchdog trip flag before re-calling so
+            # a second runaway in the CONTINUATION turn can trip again (bounded by
+            # length_continue_retries < 3). Otherwise the stale flag would abort
+            # the very next stream at its first chunk.
+            agent._reasoning_budget_forced = False
             # Progressively boost the output token budget on each retry.
             # Retry 1 → 2× base, retry 2 → 3× base, capped at 32 768.
             # Applies to all providers via _ephemeral_max_output_tokens.

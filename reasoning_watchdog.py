@@ -52,6 +52,12 @@ from typing import Callable, Optional
 # server budget the model was already asked to honour.
 DEFAULT_MAX_REASONING_TOKENS = 4096
 
+# End-of-thinking delimiter injected when the watchdog forces the model to stop
+# reasoning (s1 "budget forcing").  Qwen3.6 end-of-thinking marker (token id
+# 248069 — documentation only; we inject the string into message content, not a
+# raw token, so this stays MTP-safe / request-level).
+END_OF_THINKING_STR = "</think>"
+
 # Average characters per reasoning token used by the fallback estimator.  See the
 # module docstring for the rationale; slightly under-estimates to avoid early
 # cuts on legitimate reasoning.
