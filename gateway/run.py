@@ -13735,6 +13735,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        # Previous raw preview + its truncated form, for diff-aware
+        # truncate_middle: keeps the meaningful tail (e.g. filename) and makes
+        # distinct calls render differently so they don't false-collapse.
+        last_preview = [None]
+        last_preview_trunc = [None]
         # True when the previously enqueued progress line was a terminal
         # fenced code block — consecutive terminal calls then drop the
         # repeated "💻 terminal" header and render back-to-back blocks.
@@ -13927,7 +13932,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cmd_short = _lines[0] if _lines else _cmd_full
                 _multiline = len(_lines) > 1
                 if len(_cmd_short) > _cap:
-                    _cmd_short = _cmd_short[:_cap - 3] + "..."
+                    from agent.display import truncate_middle
+                    _raw_cmd = _cmd_short
+                    _cmd_short = truncate_middle(
+                        _raw_cmd, _cap,
+                        prev=last_preview[0], prev_trunc=last_preview_trunc[0],
+                    )
+                    last_preview[0] = _raw_cmd
+                    last_preview_trunc[0] = _cmd_short
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
@@ -13965,11 +13977,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
             elif preview:
-                from agent.display import get_tool_preview_max_len
+                from agent.display import get_tool_preview_max_len, truncate_middle
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
+                # Diff-aware middle truncation: keep the meaningful tail (e.g.
+                # the filename in a path) and reveal what differs from the
+                # previous preview, so distinct calls render differently
+                # instead of collapsing into "…(xN)".
+                _preview_raw = preview
+                preview = truncate_middle(
+                    _preview_raw, _cap,
+                    prev=last_preview[0], prev_trunc=last_preview_trunc[0],
+                )
+                last_preview[0] = _preview_raw
+                last_preview_trunc[0] = preview
                 msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
             else:
