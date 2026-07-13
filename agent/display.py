@@ -122,34 +122,23 @@ _TAIL_FRACTION_NUM = 2
 _TAIL_FRACTION_DEN = 5
 
 
-def truncate_middle(
-    text: str,
-    max_len: int,
-    prev: str | None = None,
-    prev_trunc: str | None = None,
-) -> str:
+def truncate_middle(text: str, max_len: int, prev: str | None = None) -> str:
     """Truncate ``text`` to at most ``max_len`` chars, filling the budget
     with as much content as possible while revealing what differs from
-    ``prev``.
+    ``prev``.  Presentation only — deduplication keys on raw tool identity
+    (see ``gateway/run.py``), so this never needs to preserve equality.
 
     Resolution order (each step skipped if it doesn't apply):
 
-    1. ``text == prev`` and ``prev_trunc`` provided → return ``prev_trunc``.
-       The dedup-by-equality contract is preserved by *construction*: an
-       identical re-call yields the same string downstream sees.
-    2. ``text`` fits in ``max_len`` → return ``text`` unchanged.  No
-       reason to hide characters we have room to display.
-    3. ``prev`` provided → show ``text`` from the first differing char
+    1. ``text`` fits in ``max_len`` → return ``text`` unchanged.
+    2. ``prev`` provided → show ``text`` from the first differing char
        through the end (the part the reader needs to see), then prepend
        as much of the shared prefix as remaining budget allows (with
        ``"..."`` to mark the elision).
-    4. Otherwise → stateless head + ellipsis + short tail truncation.
+    3. Otherwise → stateless head + ellipsis + short tail truncation.
 
     ``max_len`` values ``<= 0`` produce ``""``.
     """
-    if prev is not None and prev_trunc is not None and text == prev:
-        return prev_trunc
-
     if max_len <= 0:
         return ""
 

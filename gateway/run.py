@@ -13733,13 +13733,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
         last_tool = [None]  # Mutable container for tracking in closure
-        last_progress_msg = [None]  # Track last message for dedup
-        repeat_count = [0]  # How many times the same message repeated
-        # Previous raw preview + its truncated form, for diff-aware
-        # truncate_middle: keeps the meaningful tail (e.g. filename) and makes
-        # distinct calls render differently so they don't false-collapse.
-        last_preview = [None]
-        last_preview_trunc = [None]
+        # Deduplicate consecutive progress bubbles on RAW tool identity
+        # ((tool_name, raw preview)), not the rendered/truncated line — a
+        # head-cut can't guarantee distinct raw calls render distinctly.
+        last_raw_key = [None]
+        repeat_count = [0]  # How many times the same identity repeated
+        # Previous raw preview, fed to diff-aware truncate_middle so distinct
+        # calls reveal what differs (presentation only).
+        last_display_raw = [None]
         # True when the previously enqueued progress line was a terminal
         # fenced code block — consecutive terminal calls then drop the
         # repeated "💻 terminal" header and render back-to-back blocks.
@@ -13931,15 +13932,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lines = _cmd_full.splitlines()
                 _cmd_short = _lines[0] if _lines else _cmd_full
                 _multiline = len(_lines) > 1
+                _cmd_line_raw = _cmd_short
                 if len(_cmd_short) > _cap:
                     from agent.display import truncate_middle
-                    _raw_cmd = _cmd_short
                     _cmd_short = truncate_middle(
-                        _raw_cmd, _cap,
-                        prev=last_preview[0], prev_trunc=last_preview_trunc[0],
+                        _cmd_short, _cap, prev=last_display_raw[0],
                     )
-                    last_preview[0] = _raw_cmd
-                    last_preview_trunc[0] = _cmd_short
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
@@ -13973,40 +13971,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compact — unlike CLI spinners, these persist as permanent messages).
             # Terminal commands on markdown platforms get a single-line capped
             # fenced block (built above) instead of the truncated preview.
+            _dedup_ident = None   # raw identity for dedup (see below)
+            _this_display = None  # raw preview to diff the NEXT call against
             if _code_block_short is not None:
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
+                _dedup_ident = _cmd_full        # full raw command → robust identity
+                _this_display = _cmd_line_raw    # raw first line, for the next diff
             elif preview:
                 from agent.display import get_tool_preview_max_len, truncate_middle
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                # Diff-aware middle truncation: keep the meaningful tail (e.g.
-                # the filename in a path) and reveal what differs from the
-                # previous preview, so distinct calls render differently
-                # instead of collapsing into "…(xN)".
+                # Diff-aware middle truncation: reveal what differs from the
+                # previous preview so distinct calls read distinctly.
                 _preview_raw = preview
-                preview = truncate_middle(
-                    _preview_raw, _cap,
-                    prev=last_preview[0], prev_trunc=last_preview_trunc[0],
-                )
-                last_preview[0] = _preview_raw
-                last_preview_trunc[0] = preview
+                preview = truncate_middle(_preview_raw, _cap, prev=last_display_raw[0])
                 msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
+                _dedup_ident = _preview_raw   # dedup on the RAW preview, not the truncated line
+                _this_display = _preview_raw
             else:
                 msg = f"{emoji} {tool_name}..."
                 last_was_terminal_block[0] = False
             
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
+            # Dedup on RAW tool identity, not the rendered line: two distinct
+            # raw calls can truncate to the same text (must NOT merge), and
+            # identical raw calls always share a key regardless of rendering.
+            _raw_key = (tool_name, _dedup_ident)
+            if _raw_key == last_raw_key[0]:
                 repeat_count[0] += 1
                 # Update the last line in progress_lines with a counter
                 # via a special "dedup" queue message.
                 progress_queue.put(("__dedup__", msg, repeat_count[0]))
                 return
-            last_progress_msg[0] = msg
+            last_raw_key[0] = _raw_key
+            last_display_raw[0] = _this_display
             repeat_count[0] = 0
             
             progress_queue.put(msg)
@@ -14221,7 +14220,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # linearization regression after PR #7885.)
                         progress_msg_id = None
                         progress_lines = []
-                        last_progress_msg[0] = None
+                        last_raw_key[0] = None
+                        last_display_raw[0] = None
                         repeat_count[0] = 0
                         continue
                     else:
@@ -14345,7 +14345,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         pass
                                 progress_msg_id = None
                                 progress_lines = []
-                                last_progress_msg[0] = None
+                                last_raw_key[0] = None
+                                last_display_raw[0] = None
                                 repeat_count[0] = 0
                             else:
                                 progress_lines.append(raw)

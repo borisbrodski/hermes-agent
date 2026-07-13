@@ -2,9 +2,12 @@
 
 Each test is a small scenario that reads top-to-bottom like a worked
 example: the previous preview, the new preview, the budget, and the
-expected output.  Together they document what the function does and
-why each property matters for downstream dedup-by-equality in
-``gateway/run.py``.
+expected output.  Together they document what the function does and why
+the ``...`` lands where it does.
+
+``truncate_middle`` is *presentation only*: the gateway deduplicates
+consecutive progress bubbles on RAW tool identity (see
+``gateway/run.py``), so truncation never needs to preserve equality.
 """
 
 import pytest
@@ -25,9 +28,7 @@ class TestPassThroughWhenItFits:
 
     def test_short_text_with_prev_still_passes_through(self):
         # We have a prev, but text still fits — show it in full.
-        prev = "git status"
-        curr = "git diff"
-        out = truncate_middle(curr, max_len=40, prev=prev, prev_trunc=None)
+        out = truncate_middle("git diff", max_len=40, prev="git status")
         assert out == "git diff"
 
     def test_long_but_under_budget_passes_through(self):
@@ -36,33 +37,24 @@ class TestPassThroughWhenItFits:
         # thing.
         prev = "cd /opt/myproject/sub/dir && git status"
         curr = "cd /opt/myproject/sub/dir && cat README"
-        out = truncate_middle(curr, max_len=40, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=40, prev=prev)
         assert out == "cd /opt/myproject/sub/dir && cat README"
 
 
-# ── The dedup-by-equality contract ──────────────────────────────────────
+# ── Presentation only (dedup moved to raw identity) ─────────────────────
 
-class TestDedupContractEnforced:
-    """Identical re-calls must produce byte-identical output so the
-    gateway's ``msg == last_progress_msg`` check still collapses true
-    repeats into a single ``(×N)`` counter.  When ``prev_trunc`` is
-    supplied, the function returns the cache verbatim."""
+class TestPresentationOnly:
+    """``truncate_middle`` no longer round-trips a cached truncation for
+    identical re-calls — the gateway dedups on raw identity, so an
+    identical re-call may render via the head-tail fallback.  All the
+    function must guarantee is determinism and the length budget."""
 
-    def test_same_text_returns_cached_truncation(self):
-        # The previous call produced this truncation:
-        prev = "cd /opt/app && rake db:migrate VERSION=20251201"
-        prev_trunc = "cd /opt/app && r...VERSION=20251201"
-
-        # The model fires the EXACT same command again.
-        out = truncate_middle(
-            prev,                    # text == prev
-            max_len=40,
-            prev=prev,
-            prev_trunc=prev_trunc,
-        )
-
-        # We get the cached truncation back verbatim.
-        assert out == prev_trunc
+    def test_identical_recall_is_deterministic_and_bounded(self):
+        t = "cd /opt/app && rake db:migrate VERSION=20251201"
+        a = truncate_middle(t, max_len=40, prev=t)
+        b = truncate_middle(t, max_len=40, prev=t)
+        assert a == b
+        assert len(a) <= 40
 
 
 # ── Diff-aware truncation when text doesn't fit ─────────────────────────
@@ -80,7 +72,7 @@ class TestRevealsTheDiff:
         prev = "cd /opt/myproject/sub/dir && git status"
         curr = "cd /opt/myproject/sub/dir && cat README"
 
-        out = truncate_middle(curr, max_len=20, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=20, prev=prev)
 
         # 10 chars "cat README" + 3 chars "..." + 7 chars beginning prefix = 20
         assert out == "cd /opt...cat README"
@@ -92,7 +84,7 @@ class TestRevealsTheDiff:
         prev = "cd /home/user/path/X && ls"
         curr = "cd /home/user/path/X/Y && ls"
 
-        out = truncate_middle(curr, max_len=20, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=20, prev=prev)
 
         # 8 chars "/Y && ls" + 3 chars "..." + 9 chars "cd /home/" = 20
         assert out == "cd /home/.../Y && ls"
@@ -104,7 +96,7 @@ class TestRevealsTheDiff:
         prev = "cd /opt/myproject/sub/dir && git status --short"
         curr = "cd /opt/myproject/sub/dir && cat README"
 
-        out = truncate_middle(curr, max_len=13, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=13, prev=prev)
 
         # The 10-char "cat README" plus "..." takes 13 → no room for any
         # prefix content, just the elision marker.
@@ -120,7 +112,7 @@ class TestFallbackWhenDiffTooBig:
     def test_huge_paste_after_tiny_shared_prefix(self):
         prev = "ab"
         curr = "ab" + ("x" * 100)
-        out = truncate_middle(curr, max_len=20, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=20, prev=prev)
         assert len(out) == 20
         assert "..." in out
 
@@ -128,7 +120,7 @@ class TestFallbackWhenDiffTooBig:
         # No common prefix → no diff-aware path possible.
         prev = "alpha"
         curr = "completely-different-very-long-string-here"
-        out = truncate_middle(curr, max_len=15, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=15, prev=prev)
         assert len(out) == 15
         assert "..." in out
 
@@ -161,7 +153,7 @@ class TestEdgeCases:
         # content.  This case exists for parity, not common use.
         prev = "x"
         curr = "x-here-is-a-very-long-tail-that-fills-most-of-the-budget"
-        out = truncate_middle(curr, max_len=20, prev=prev, prev_trunc=None)
+        out = truncate_middle(curr, max_len=20, prev=prev)
         # Tail alone is much longer than budget → head-tail fallback.
         assert len(out) == 20
 
@@ -169,36 +161,29 @@ class TestEdgeCases:
 # ── End-to-end against the gateway dedup loop ───────────────────────────
 
 class TestGatewayDedupPipeline:
-    """Simulate the producer side of ``gateway/run.py``: feed a list of
-    previews through ``truncate_middle`` exactly the way the gateway
-    does, then check the dedup-by-equality state.
-
-    The helper here mirrors gateway/run.py's last_progress_preview /
-    last_progress_preview_trunc / last_progress_msg state vars.
-    """
+    """Simulate the producer side of ``gateway/run.py``: dedup on RAW
+    identity ``(tool_name, raw preview)`` while ``truncate_middle`` runs
+    for display only.  The counts hold regardless of how the previews
+    truncate — that is the whole point of keying on raw identity."""
 
     @staticmethod
     def _simulate(previews, max_len=40):
         """Run the gateway's producer loop.  Return
         ``(distinct_msgs, repeat_ticks)``."""
-        last_preview = None
-        last_trunc = None
-        last_msg = None
+        last_raw_key = None
+        last_display_raw = None
         distinct = 0
         repeats = 0
         for preview in previews:
-            trunc = truncate_middle(
-                preview, max_len,
-                prev=last_preview, prev_trunc=last_trunc,
-            )
-            msg = f'💻 terminal: "{trunc}"'
-            if msg == last_msg:
+            raw_key = ("terminal", preview)
+            # Display only — its output does NOT drive dedup.
+            _ = truncate_middle(preview, max_len, prev=last_display_raw)
+            if raw_key == last_raw_key:
                 repeats += 1
             else:
                 distinct += 1
-                last_msg = msg
-            last_preview = preview
-            last_trunc = trunc
+                last_raw_key = raw_key
+                last_display_raw = preview
         return distinct, repeats
 
     def test_five_true_repeats_collapse_into_one_message_plus_four_ticks(self):
@@ -229,8 +214,8 @@ class TestGatewayDedupPipeline:
         assert self._simulate(previews) == (2, 2)
 
     def test_long_shared_path_under_tight_budget_distinguishes(self):
-        # 20-char budget, 39-char commands; diff-aware truncation
-        # must keep each visibly distinct.
+        # 20-char budget, 39-char commands.  Even if two previews were to
+        # truncate alike, raw-identity keying keeps them distinct.
         previews = [
             "cd /opt/myproject/sub/dir && git status",
             "cd /opt/myproject/sub/dir && cat README",
