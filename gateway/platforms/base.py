@@ -2104,10 +2104,8 @@ class BasePlatformAdapter(ABC):
         if preview:
             cap = preview_max_len if preview_max_len > 0 else 40
             prev = getattr(self, "_tool_preview_prev", None)
-            prev_trunc = getattr(self, "_tool_preview_prev_trunc", None)
-            shown = truncate_middle(preview, cap, prev=prev, prev_trunc=prev_trunc)
+            shown = truncate_middle(preview, cap, prev=prev)
             self._tool_preview_prev = preview
-            self._tool_preview_prev_trunc = shown
             return f"{emoji} {event.tool_name}: \"{shown}\""
         return f"{emoji} {event.tool_name}..."
 
